@@ -1,5 +1,5 @@
 run:
-  name: spider_decoding_strategies_v1
+  name: spider_decoding_strategies_v2_f1
   seed: 0
   out_dir: runs
   cache_dir: runs_cache
@@ -7,7 +7,7 @@ run:
 data:
   dataset: spider
   split: dev
-  max_examples: 300          # start small; later set null for full dev
+  max_examples: 30          # start small; later set null for full dev
   hf_name: xlangai/spider    # HF mirror of Spider
 
 llm:
@@ -25,7 +25,7 @@ llm:
   concurrency: 2
 
 verifier:
-  type: execution_accuracy   # executes against Spider sqlite DB
+  type: execution_f1   # executes against Spider sqlite DB
   # (no extra model needed)
 
 strategies:
