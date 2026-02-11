@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-import re
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 import torch
 import yaml
@@ -13,48 +14,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.cache import DiskCache
-from src.strategies import build_prompt, build_refine_prompt
-from src.spider_eval import execution_accuracy, execution_f1
-
-def run_one_strategy(llm, cache, ex, strat, cfg, data_root):
-    verifier_type = cfg.get("verifier", {}).get("type", "execution_accuracy")
-
-    key = {
-        "run_name": cfg["run"]["name"],
-        "model_id": cfg["llm"]["model_id"],  # (or whatever your generate.py uses for local model)
-        "strategy": strat,
-        "verifier_type": verifier_type,
-        "db_id": ex.get("db_id"),
-        "question": ex.get("question"),
-        # optionally include schema string if you want stricter caching
-    }
-
-    cached = cache.get_json(key)
-    if cached is not None:
-        return cached
-
-    q = ex["question"]
-    sch = schema_string(ex)
-    db = db_path(ex, data_root)
-    gold = gold_sql(ex)
-
-    if verifier_type == "execution_accuracy":
-        def score_sql(sql: str) -> float:
-            return execution_accuracy(db, sql, gold)
-    elif verifier_type == "execution_f1":
-        def score_sql(sql: str) -> float:
-            return execution_f1(db, sql, gold)
-    else:
-        raise ValueError(f"Unknown verifier.type: {verifier_type}")
-
-    # ---- keep the rest of your strategy logic the same ----
-    # single / bon / iad should call score_sql(...) to score candidates
-    # and store out = {"sql": ..., "score": ..., "candidates": ...}
-
-    # finally:
-    cache.set_json(key, out)
-    return out
-
+from src.spider_eval import clean_sql, combined_reward
 
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -65,17 +25,15 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
     return out
 
 
-def schema_string(ex: Dict[str, Any]) -> str:
-    # Best effort: dataset variants differ
-    for k in ["schema", "db_schema", "schema_str", "create_table_statement"]:
-        v = ex.get(k)
-        if isinstance(v, str) and v.strip():
-            return v
+def stable_hash_str(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-    if "table_names_original" in ex and "column_names_original" in ex:
-        return f"Tables: {ex['table_names_original']}\nColumns: {ex['column_names_original']}"
 
-    return "Schema unavailable (dataset variant)."
+def gold_sql(ex: Dict[str, Any]) -> str:
+    for k in ["query", "sql", "gold", "gold_sql"]:
+        if k in ex and isinstance(ex[k], str) and ex[k].strip():
+            return ex[k]
+    raise ValueError("Missing gold SQL in dataset example")
 
 
 def db_path(ex: Dict[str, Any], data_root: str) -> str:
@@ -85,249 +43,242 @@ def db_path(ex: Dict[str, Any], data_root: str) -> str:
     cand = os.path.join(data_root, "database", db_id, f"{db_id}.sqlite")
     if os.path.exists(cand):
         return cand
-
+    # Some variants may store explicit paths
     for k in ["db_path", "database_path", "sqlite_path"]:
-        v = ex.get(k)
-        if isinstance(v, str) and os.path.exists(v):
-            return v
-
-    raise FileNotFoundError(f"Could not locate sqlite db for db_id={db_id}")
-
-
-def gold_sql(ex: Dict[str, Any]) -> str:
-    for k in ["query", "sql", "gold", "gold_sql"]:
-        v = ex.get(k)
-        if isinstance(v, str) and v.strip():
-            return v
-    raise ValueError("Missing gold SQL in dataset example")
+        p = ex.get(k)
+        if isinstance(p, str) and os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"Could not locate sqlite db for db_id={db_id} (looked for {cand})")
 
 
-_SQL_FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-
-
-def extract_sql(text: str) -> str:
+def build_schema_map(tables_json_path: str) -> Dict[str, str]:
     """
-    Make outputs robust:
-      - If the model returns ```sql ...```, extract inside.
-      - Strip leading role text, keep first SQL-ish chunk.
-      - If multiple statements, keep everything (Spider gold sometimes uses ;).
+    Build a schema text per db_id using Spider tables.json.
+    This is crucial; otherwise the model hallucinates table names (singers vs singer).
     """
-    t = text.strip()
+    if not os.path.exists(tables_json_path):
+        print(f"[warn] tables.json not found at {tables_json_path}; schema will be empty (quality will be poor).")
+        return {}
 
-    m = _SQL_FENCE_RE.search(t)
-    if m:
-        t = m.group(1).strip()
+    with open(tables_json_path, "r", encoding="utf-8") as f:
+        tables = json.load(f)
 
-    # Remove obvious chat headers if they appear in decoded text
-    # e.g., "assistant\n..."; keep last portion if that happens
-    for prefix in ["assistant\n", "assistant:", "Assistant:", "ASSISTANT:"]:
-        if t.startswith(prefix):
-            t = t[len(prefix) :].strip()
+    out: Dict[str, str] = {}
+    for t in tables:
+        db_id = t["db_id"]
+        table_names = t.get("table_names_original", t.get("table_names", []))
+        col_names = t.get("column_names_original", t.get("column_names", []))
+        col_types = t.get("column_types", [])
+        pks = set(t.get("primary_keys", []))
+        fks = t.get("foreign_keys", [])
 
-    # If still contains markdown fences (rare), strip them
-    t = t.replace("```sql", "").replace("```", "").strip()
+        # columns: list of [table_id, column_name]
+        cols_by_table: Dict[int, List[str]] = {}
+        for idx, pair in enumerate(col_names):
+            table_id, col = pair
+            if table_id == -1:
+                continue
+            ty = col_types[idx] if idx < len(col_types) else ""
+            pk = " PK" if idx in pks else ""
+            cols_by_table.setdefault(table_id, []).append(f"{col} ({ty}){pk}".strip())
 
-    # Some models prepend "SQL:" or similar
-    if t.lower().startswith("sql:"):
-        t = t[4:].strip()
+        lines: List[str] = []
+        lines.append("Database schema:")
+        for tid, tname in enumerate(table_names):
+            cols = cols_by_table.get(tid, [])
+            if cols:
+                lines.append(f"- {tname}: " + ", ".join(cols))
+            else:
+                lines.append(f"- {tname}")
 
-    return t
+        if fks:
+            lines.append("Foreign keys:")
+            # fks is list of [col_idx_1, col_idx_2]
+            for a, b in fks:
+                # map column idx -> (table, col)
+                try:
+                    ta, ca = col_names[a]
+                    tb, cb = col_names[b]
+                    if ta != -1 and tb != -1:
+                        lines.append(f"- {table_names[ta]}.{ca} -> {table_names[tb]}.{cb}")
+                except Exception:
+                    continue
+
+        out[db_id] = "\n".join(lines).strip()
+
+    return out
 
 
-class LocalHFChatLLM:
-    """
-    Minimal local “chat” wrapper using Transformers.
-    Assumes the tokenizer supports apply_chat_template (Qwen2.5 does).
-    """
+SYSTEM_SQL = "You are a text-to-SQL system. Return ONLY a single SQL query. No markdown. No explanation."
 
-    def __init__(self, model_id: str, dtype: torch.dtype = torch.float16):
-        self.model_id = model_id
-        self.tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+
+def build_prompt(question: str, schema: str) -> str:
+    # Qwen chat template will wrap it; we pass messages in a compatible form
+    # but here we build the user content string.
+    return f"Schema:\n{schema}\n\nQuestion:\n{question}\n\nSQL:"
+
+
+@dataclass
+class LocalLLM:
+    model_id: str
+    max_new_tokens: int
+    device: str = "cuda"
+
+    def __post_init__(self) -> None:
+        self.tok = AutoTokenizer.from_pretrained(self.model_id, use_fast=True)
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=dtype,
+            self.model_id,
+            torch_dtype=torch.float16,
             device_map="auto",
         )
         self.model.eval()
 
-    @property
-    def device(self) -> torch.device:
-        return self.model.device
-
-    @torch.inference_mode()
-    def chat(
-        self,
-        messages: List[Dict[str, str]],
-        max_new_tokens: int,
-        do_sample: bool,
-        temperature: float,
-        top_p: float,
-    ) -> str:
-        text = self.tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.tok(text, return_tensors="pt").to(self.device)
+    @torch.no_grad()
+    def chat(self, messages: List[Dict[str, str]], *, do_sample: bool, temperature: float, top_p: float) -> str:
+        text = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tok(text, return_tensors="pt").to(self.model.device)
 
         gen_kwargs: Dict[str, Any] = dict(
-            max_new_tokens=int(max_new_tokens),
+            max_new_tokens=self.max_new_tokens,
             do_sample=bool(do_sample),
         )
+        # Transformers will error if temperature==0 and do_sample=True
         if do_sample:
-            gen_kwargs["temperature"] = float(temperature)
+            gen_kwargs["temperature"] = max(float(temperature), 1e-6)
             gen_kwargs["top_p"] = float(top_p)
 
         out = self.model.generate(**inputs, **gen_kwargs)
-        decoded = self.tok.decode(out[0], skip_special_tokens=True)
-        return decoded
+        return self.tok.decode(out[0], skip_special_tokens=True)
 
 
-def run_one_strategy(
-    llm: LocalHFChatLLM,
+def run_one(
+    llm: LocalLLM,
     cache: DiskCache,
     ex: Dict[str, Any],
+    ex_idx: int,
     strat: Dict[str, Any],
     cfg: Dict[str, Any],
     data_root: str,
+    schema_map: Dict[str, str],
 ) -> Dict[str, Any]:
-    # Stable identifiers
-    ex_id = ex.get("question_id", ex.get("id", None))
-    q = ex["question"]
-    sch = schema_string(ex)
-    db = db_path(ex, data_root)
+    db_id = ex.get("db_id", "")
+    q = ex.get("question", "")
     gold = gold_sql(ex)
+    db = db_path(ex, data_root)
 
-    # Caching key: include the local model + decoding params
-    # so changing them doesn’t reuse stale outputs.
-    llm_cfg = cfg.get("llm", {})
-    model_id = llm_cfg.get("local_model_id", "Qwen/Qwen2.5-7B-Instruct")
-    max_tokens = int(llm_cfg.get("max_tokens", 512))
-    temperature = float(llm_cfg.get("temperature", 0.7))
-    top_p = float(llm_cfg.get("top_p", 0.9))
+    schema = schema_map.get(db_id, "")
+    schema_h = stable_hash_str(schema) if schema else "no_schema"
 
+    reward_version = "v2_execf1_plus_tokf1"
     key = {
         "run_name": cfg["run"]["name"],
-        "backend": "local_transformers",
-        "local_model_id": model_id,
+        "model_id": cfg["llm"]["model_id"],
+        "max_new_tokens": int(cfg["llm"]["max_new_tokens"]),
+        "temperature": float(cfg["llm"]["temperature"]),
+        "top_p": float(cfg["llm"]["top_p"]),
         "strategy": strat,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "example_id": ex_id,
-        "db_id": ex.get("db_id"),
+        "db_id": db_id,
+        "schema_hash": schema_h,
         "question": q,
+        "gold_hash": stable_hash_str(gold),
+        "reward_version": reward_version,
     }
 
     cached = cache.get_json(key)
     if cached is not None:
         return cached
 
-    def score_sql(pred_sql: str) -> float:
-        return float(execution_accuracy(db, pred_sql, gold))
+    def do_messages(sql_user: str) -> List[Dict[str, str]]:
+        return [
+            {"role": "system", "content": SYSTEM_SQL},
+            {"role": "user", "content": sql_user},
+        ]
 
     typ = strat["type"]
 
+    # strategy: make BON/IAD sampled to get diversity; single can be greedy
+    base_do_sample = bool(cfg["llm"].get("do_sample_single", False))
+    temperature = float(cfg["llm"]["temperature"])
+    top_p = float(cfg["llm"]["top_p"])
+
+    candidates: List[Dict[str, Any]] = []
+
     if typ == "single":
-        messages = build_prompt(q, sch)
         raw = llm.chat(
-            messages,
-            max_new_tokens=max_tokens,
-            do_sample=False,
+            do_messages(build_prompt(q, schema)),
+            do_sample=base_do_sample,
             temperature=temperature,
             top_p=top_p,
         )
-        sql = extract_sql(raw)
-        s = score_sql(sql)
-        out = {
-            "example_id": ex_id,
-            "db_id": ex.get("db_id"),
-            "strategy": strat.get("name", "single"),
-            "sql": sql,
-            "score": s,
-            "candidates": [{"sql": sql, "score": s}],
-        }
+        pred = clean_sql(raw)
+        score = combined_reward(db, pred, gold, w_exec=float(cfg["verifier"]["w_exec"]))
+        candidates.append({"raw": raw, "pred": pred, "score": score})
+        best = max(candidates, key=lambda c: c["score"])
 
     elif typ == "bon":
         n = int(strat["n"])
-        cands: List[Dict[str, Any]] = []
-        best_sql: Optional[str] = None
-        best_score: float = -1.0
-
-        # For BON we sample to get diversity
         for _ in range(n):
             raw = llm.chat(
-                build_prompt(q, sch),
-                max_new_tokens=max_tokens,
+                do_messages(build_prompt(q, schema)),
                 do_sample=True,
                 temperature=temperature,
                 top_p=top_p,
             )
-            sql = extract_sql(raw)
-            s = score_sql(sql)
-            cands.append({"sql": sql, "score": s})
-            if s > best_score:
-                best_score = s
-                best_sql = sql
-
-        assert best_sql is not None
-        out = {
-            "example_id": ex_id,
-            "db_id": ex.get("db_id"),
-            "strategy": strat.get("name", f"bon_{n}"),
-            "sql": best_sql,
-            "score": best_score,
-            "candidates": cands,
-        }
+            pred = clean_sql(raw)
+            score = combined_reward(db, pred, gold, w_exec=float(cfg["verifier"]["w_exec"]))
+            candidates.append({"raw": raw, "pred": pred, "score": score})
+        best = max(candidates, key=lambda c: c["score"])
 
     elif typ == "iad":
         t = int(strat["t"])
-        cands: List[Dict[str, Any]] = []
-
-        # initial (sample to avoid getting stuck in same bad answer)
+        # initial sample
         raw0 = llm.chat(
-            build_prompt(q, sch),
-            max_new_tokens=max_tokens,
+            do_messages(build_prompt(q, schema)),
             do_sample=True,
             temperature=temperature,
             top_p=top_p,
         )
-        sql0 = extract_sql(raw0)
-        s0 = score_sql(sql0)
-        cands.append({"sql": sql0, "score": s0})
+        pred0 = clean_sql(raw0)
+        s0 = combined_reward(db, pred0, gold, w_exec=float(cfg["verifier"]["w_exec"]))
+        candidates.append({"raw": raw0, "pred": pred0, "score": s0})
 
-        def best_and_worst(cands_: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-            best = max(cands_, key=lambda d: float(d["score"]))
-            worst = min(cands_, key=lambda d: float(d["score"]))
-            return best, worst
+        best = max(candidates, key=lambda c: c["score"])
+        worst = min(candidates, key=lambda c: c["score"])
 
-        best, worst = best_and_worst(cands)
-
-        # refine steps
         for _ in range(1, t):
+            refine_user = (
+                f"Schema:\n{schema}\n\nQuestion:\n{q}\n\n"
+                f"Best attempt so far:\n{best['pred']}\n\n"
+                f"Worst attempt so far:\n{worst['pred']}\n\n"
+                "Improve upon the best SQL while avoiding mistakes from the worst. Return ONLY SQL."
+            )
             raw = llm.chat(
-                build_refine_prompt(
-                    q, sch, best["sql"], float(best["score"]), worst["sql"], float(worst["score"])
-                ),
-                max_new_tokens=max_tokens,
+                do_messages(refine_user),
                 do_sample=True,
                 temperature=temperature,
                 top_p=top_p,
             )
-            sql = extract_sql(raw)
-            s = score_sql(sql)
-            cands.append({"sql": sql, "score": s})
-            best, worst = best_and_worst(cands)
-
-        out = {
-            "example_id": ex_id,
-            "db_id": ex.get("db_id"),
-            "strategy": strat.get("name", f"iad_{t}"),
-            "sql": best["sql"],
-            "score": float(best["score"]),
-            "candidates": cands,
-        }
+            pred = clean_sql(raw)
+            score = combined_reward(db, pred, gold, w_exec=float(cfg["verifier"]["w_exec"]))
+            candidates.append({"raw": raw, "pred": pred, "score": score})
+            best = max(candidates, key=lambda c: c["score"])
+            worst = min(candidates, key=lambda c: c["score"])
 
     else:
         raise ValueError(f"Unknown strategy type: {typ}")
+
+    out = {
+        "example_index": ex_idx,
+        "strategy_name": str(strat["name"]),
+        "db_id": db_id,
+        "question": q,
+        "gold_sql": clean_sql(gold),
+        "best_pred_sql": best["pred"],
+        "score": float(best["score"]),
+        "candidates": candidates,
+        "schema_hash": schema_h,
+        "reward_version": reward_version,
+    }
 
     cache.set_json(key, out)
     return out
@@ -341,53 +292,55 @@ def main() -> None:
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    # --- paths (keep exactly as in your project)
-    data_root = "data/spider"
+    data_root = cfg["data"]["data_root"]
     split = cfg["data"]["split"]
-    jsonl = os.path.join(
-        data_root, "validation.jsonl" if split == "dev" else f"{split}.jsonl"
-    )
-
+    jsonl = os.path.join(data_root, "validation.jsonl" if split == "dev" else f"{split}.jsonl")
     examples = load_jsonl(jsonl)
+
     max_ex = cfg["data"].get("max_examples")
     if max_ex:
         examples = examples[: int(max_ex)]
 
-    # --- local model config
-    llm_cfg = cfg.get("llm", {})
-    model_id = llm_cfg.get("local_model_id", "Qwen/Qwen2.5-7B-Instruct")
+    # schema map (requires official Spider tables.json)
+    tables_json = os.path.join(data_root, "tables.json")
+    schema_map = build_schema_map(tables_json)
 
-    # NOTE: dtype float16 is usually correct on Runpod GPUs
-    llm = LocalHFChatLLM(model_id=model_id, dtype=torch.float16)
+    llm = LocalLLM(
+        model_id=cfg["llm"]["model_id"],
+        max_new_tokens=int(cfg["llm"]["max_new_tokens"]),
+    )
 
-    # --- cache
-    cache_dir = cfg["run"]["cache_dir"]
-    os.makedirs(cache_dir, exist_ok=True)
-    cache = DiskCache(cache_dir)
+    cache = DiskCache(cfg["run"]["cache_dir"])
+    os.makedirs(cfg["run"]["cache_dir"], exist_ok=True)
 
-    strategies = cfg["strategies"]
-
-    # --- output folder
-    run_id = f"{cfg['run']['name']}_{model_id.replace('/', '__')}"
+    # run id directory
+    safe_model = cfg["llm"]["model_id"].replace("/", "__")
+    run_id = f"{cfg['run']['name']}_{safe_model}"
     out_dir = os.path.join(cfg["run"]["out_dir"], run_id)
     os.makedirs(out_dir, exist_ok=True)
 
-    # --- run
-    results: List[Dict[str, Any]] = []
-    for ex in tqdm(examples, desc="Generating (cached)"):
-        if "question" not in ex:
+    strategies = cfg["strategies"]
+
+    rows: List[Dict[str, Any]] = []
+    total = len(examples) * len(strategies)
+
+    print(f"[info] examples={len(examples)} strategies={len(strategies)} total_jobs={total}")
+    print(f"[info] writing materialized results to {out_dir}/materialized_results.jsonl")
+
+    for i, ex in enumerate(tqdm(examples, desc="Generating (cached)")):
+        if "question" not in ex or not ex["question"]:
             continue
         for strat in strategies:
-            r = run_one_strategy(llm, cache, ex, strat, cfg, data_root)
-            results.append(r)
+            r = run_one(llm, cache, ex, i, strat, cfg, data_root, schema_map)
+            rows.append(r)
 
     mat_path = os.path.join(out_dir, "materialized_results.jsonl")
     with open(mat_path, "w", encoding="utf-8") as f:
-        for r in results:
+        for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     print(f"[ok] generated + cached. materialized at {mat_path}")
-    print(f"[ok] cuda: {torch.cuda.is_available()} | model: {model_id}")
+    print(f"[ok] cuda: {torch.cuda.is_available()} | model: {cfg['llm']['model_id']}")
 
 
 if __name__ == "__main__":
