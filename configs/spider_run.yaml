@@ -1,32 +1,24 @@
 run:
-  name: spider_decoding_strategies_v2_f1
+  name: spider_decoding_strategies_v2_continuous
   seed: 0
   out_dir: runs
-  cache_dir: runs_cache
+  cache_dir: runs_cache_v2
 
 data:
+  data_root: data/spider
   dataset: spider
   split: dev
-  max_examples: 30          # start small; later set null for full dev
-  hf_name: xlangai/spider    # HF mirror of Spider
+  max_examples: 30
 
 llm:
-  provider: local_transformers
   model_id: Qwen/Qwen2.5-7B-Instruct
-  dtype: float16
-  device_map: auto
-
-  # decoding knobs (match your previous usage)
-  temperature: 0.2
-  max_tokens: 256
-
-  # concurrency here is for your asyncio task scheduler.
-  # With local inference, too high will thrash GPU memory.
-  concurrency: 2
+  max_new_tokens: 160
+  temperature: 0.7
+  top_p: 0.95
+  do_sample_single: false
 
 verifier:
-  type: execution_f1   # executes against Spider sqlite DB
-  # (no extra model needed)
+  w_exec: 0.7   # reward = 0.7*execution_F1 + 0.3*sql_token_F1
 
 strategies:
   - name: single
@@ -37,25 +29,16 @@ strategies:
   - name: bon_4
     type: bon
     n: 4
-  - name: bon_8
-    type: bon
-    n: 8
   - name: iad_2
     type: iad
     t: 2
-  - name: iad_3
-    type: iad
-    t: 3
-  - name: iad_4
-    type: iad
-    t: 4
 
 selection:
-  M: 3
+  M: 2
   delta: 0.1
   replications: 200
   cal_frac: 0.5
 
 plots:
   make_example_band_plot: true
-  example_strategy_rank: 1     # pick the best selected in a replication
+  example_strategy_rank: 1
