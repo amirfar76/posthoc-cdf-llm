@@ -13,8 +13,48 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.cache import DiskCache
-from src.spider_eval import execution_accuracy
 from src.strategies import build_prompt, build_refine_prompt
+from src.spider_eval import execution_accuracy, execution_f1
+
+def run_one_strategy(llm, cache, ex, strat, cfg, data_root):
+    verifier_type = cfg.get("verifier", {}).get("type", "execution_accuracy")
+
+    key = {
+        "run_name": cfg["run"]["name"],
+        "model_id": cfg["llm"]["model_id"],  # (or whatever your generate.py uses for local model)
+        "strategy": strat,
+        "verifier_type": verifier_type,
+        "db_id": ex.get("db_id"),
+        "question": ex.get("question"),
+        # optionally include schema string if you want stricter caching
+    }
+
+    cached = cache.get_json(key)
+    if cached is not None:
+        return cached
+
+    q = ex["question"]
+    sch = schema_string(ex)
+    db = db_path(ex, data_root)
+    gold = gold_sql(ex)
+
+    if verifier_type == "execution_accuracy":
+        def score_sql(sql: str) -> float:
+            return execution_accuracy(db, sql, gold)
+    elif verifier_type == "execution_f1":
+        def score_sql(sql: str) -> float:
+            return execution_f1(db, sql, gold)
+    else:
+        raise ValueError(f"Unknown verifier.type: {verifier_type}")
+
+    # ---- keep the rest of your strategy logic the same ----
+    # single / bon / iad should call score_sql(...) to score candidates
+    # and store out = {"sql": ..., "score": ..., "candidates": ...}
+
+    # finally:
+    cache.set_json(key, out)
+    return out
+
 
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
