@@ -17,7 +17,7 @@ llm:
   device_map: auto
 
   # decoding knobs (match your previous usage)
-  temperature: 0.0
+  temperature: 0.2
   max_tokens: 256
 
   # concurrency here is for your asyncio task scheduler.
