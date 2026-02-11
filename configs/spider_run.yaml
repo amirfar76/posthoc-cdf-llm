@@ -11,14 +11,18 @@ data:
   hf_name: xlangai/spider    # HF mirror of Spider
 
 llm:
-  provider: openai_compatible
-  base_url_env: OPENAI_BASE_URL
-  api_key_env: OPENAI_API_KEY
-  model_env: OPENAI_MODEL
-  temperature: 0.2
-  max_tokens: 512
-  concurrency: 20
-  request_timeout_s: 120
+  provider: local_transformers
+  model_id: Qwen/Qwen2.5-7B-Instruct
+  dtype: float16
+  device_map: auto
+
+  # decoding knobs (match your previous usage)
+  temperature: 0.0
+  max_tokens: 256
+
+  # concurrency here is for your asyncio task scheduler.
+  # With local inference, too high will thrash GPU memory.
+  concurrency: 2
 
 verifier:
   type: execution_accuracy   # executes against Spider sqlite DB
