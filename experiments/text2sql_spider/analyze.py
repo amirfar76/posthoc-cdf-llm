@@ -1,19 +1,86 @@
 from __future__ import annotations
-import argparse, os, json, random
-from typing import Any, Dict, List, Tuple
+
+import argparse
+import glob
+import json
+import os
+from typing import Any, Dict, List
+
 import numpy as np
-import pandas as pd
 import yaml
 import matplotlib.pyplot as plt
 
 from src.posthoc_bands import eps_sqrt_calibrator, cdf_band_from_samples
 
+
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    out = []
+    out: List[Dict[str, Any]] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
+            line = line.strip()
+            if not line:
+                continue
             out.append(json.loads(line))
     return out
+
+
+def _slug_model_name(name: str) -> str:
+    # match how generate.py writes folder names (it used model.replace("/", "__"))
+    return name.replace("/", "__")
+
+
+def resolve_run_dir(cfg: Dict[str, Any]) -> str:
+    """
+    Prefer deterministic run_dir based on config.
+    If missing or not found, fallback to auto-detecting newest matching run directory.
+    """
+    out_root = cfg["run"]["out_dir"]
+    run_name = cfg["run"]["name"]
+
+    llm = cfg.get("llm", {})
+    model_name = llm.get("model_name")
+    temp = llm.get("temperature", None)
+
+    # 1) Deterministic (new local HF path): runs/<run_name>_<model_slug>
+    if model_name:
+        cand = os.path.join(out_root, f"{run_name}_{_slug_model_name(model_name)}")
+        if os.path.isdir(cand):
+            return cand
+
+    # 2) Old OpenAI-like path (if user kept it): runs/<run_name>_<MODELENV>_tempX
+    # Try to reconstruct if model_env exists
+    model_env = llm.get("model_env")
+    if model_env:
+        env_val = os.environ.get(model_env)
+        if env_val:
+            suffix = f"{run_name}_{env_val}"
+            if temp is not None:
+                suffix += f"_temp{temp}"
+            cand = os.path.join(out_root, suffix)
+            if os.path.isdir(cand):
+                return cand
+
+    # 3) Fallback: find any directory starting with runs/<run_name>_*
+    pattern = os.path.join(out_root, f"{run_name}_*")
+    cands = [p for p in glob.glob(pattern) if os.path.isdir(p)]
+    if not cands:
+        raise FileNotFoundError(
+            f"[error] Could not find any run directories matching: {pattern}\n"
+            f"Expected something like:\n"
+            f"  {out_root}/{run_name}_<model>\n"
+            f"or (older format)\n"
+            f"  {out_root}/{run_name}_<model>_temp<temperature>\n"
+        )
+
+    # choose most recently modified directory (likely your latest run)
+    cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return cands[0]
+
+
+def ecdf(samples: np.ndarray, xgrid: np.ndarray) -> np.ndarray:
+    s = np.sort(samples)
+    return np.searchsorted(s, xgrid, side="right") / max(len(s), 1)
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -23,56 +90,60 @@ def main() -> None:
     with open(args.config, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    model = os.environ.get(cfg["llm"]["model_env"], "model")
-    run_id = f"{cfg['run']['name']}_{model}_temp{cfg['llm']['temperature']}"
-    out_dir = os.path.join(cfg["run"]["out_dir"], run_id)
-    os.makedirs(out_dir, exist_ok=True)
-    plot_dir = os.path.join(out_dir, "plots")
+    run_dir = resolve_run_dir(cfg)
+    mat_path = os.path.join(run_dir, "materialized_results.jsonl")
+    if not os.path.exists(mat_path):
+        raise FileNotFoundError(
+            f"[error] materialized_results.jsonl not found at:\n  {mat_path}\n"
+            f"Run directory resolved to:\n  {run_dir}\n"
+            f"Contents:\n  {sorted(os.listdir(run_dir))}\n"
+        )
+
+    plot_dir = os.path.join(run_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
 
-    # We re-read examples directly from cache materialization.
-    mat_path = os.path.join(out_dir, "materialized_results.jsonl")
     rows = load_jsonl(mat_path)
 
-    # Build a table keyed by (example_index, strategy_name)
-    # NOTE: materialized rows are just outputs; so we need to reconstruct mapping.
-    # In v1, easiest is to rebuild by regenerating the same iteration order:
-    # Instead, we store “strategy” and “example_id” inside the cached object if you want.
-    # For now: we parse materialized_results only, assumes same ordering is stable.
-
-    # For simplicity: store results as list; we’ll infer K strategies from config and slice.
     strategies = cfg["strategies"]
     K = len(strategies)
+    strat_names = [s["name"] for s in strategies]
 
-    # We also need a stable list of examples length:
-    # materialized rows are in blocks of K per example.
-    assert len(rows) % K == 0, "materialized results length not divisible by num strategies"
+    if len(rows) % K != 0:
+        raise ValueError(
+            f"[error] materialized results length {len(rows)} is not divisible by K={K}.\n"
+            f"This usually means generate.py changed output ordering or crashed mid-write.\n"
+            f"Try re-running generate, or delete {mat_path} and regenerate."
+        )
+
     n_ex = len(rows) // K
-
-    # scores[ex_idx, strat_idx]
     scores = np.zeros((n_ex, K), dtype=float)
     for i in range(n_ex):
         for j in range(K):
-            scores[i, j] = float(rows[i*K + j]["score"])
+            scores[i, j] = float(rows[i * K + j]["score"])
 
-    strat_names = [s["name"] for s in strategies]
-    rng = np.random.default_rng(int(cfg["run"]["seed"]))
+    rng = np.random.default_rng(int(cfg["run"].get("seed", 0)))
 
     M = int(cfg["selection"]["M"])
     delta = float(cfg["selection"]["delta"])
     R = int(cfg["selection"]["replications"])
     cal_frac = float(cfg["selection"]["cal_frac"])
+
     n_cal = int(np.floor(cal_frac * n_ex))
     n_hol = n_ex - n_cal
+    if n_cal <= 1 or n_hol <= 1:
+        raise ValueError(
+            f"[error] Too few examples for split: n_ex={n_ex}, n_cal={n_cal}, n_hol={n_hol}.\n"
+            f"Increase data.max_examples in configs/spider_run.yaml."
+        )
 
-    def ecdf(samples: np.ndarray, xgrid: np.ndarray) -> np.ndarray:
-        s = np.sort(samples)
-        return np.searchsorted(s, xgrid, side="right") / len(s)
-
-    fcps = []
+    fcps: List[float] = []
     example_band_made = False
 
-    for r in range(R):
+    make_example = bool(cfg.get("plots", {}).get("make_example_band_plot", True))
+    example_rank = int(cfg.get("plots", {}).get("example_strategy_rank", 1)) - 1
+    example_rank = max(0, min(example_rank, M - 1))
+
+    for _ in range(R):
         idx = rng.permutation(n_ex)
         cal_idx = idx[:n_cal]
         hol_idx = idx[n_cal:]
@@ -81,47 +152,49 @@ def main() -> None:
         hol_scores = scores[hol_idx, :]
 
         means = cal_scores.mean(axis=0)
-        sel = np.argsort(-means)[:M]  # top M
+        sel = np.argsort(-means)[:M]  # top M by mean reward
         S = len(sel)
 
-        # Build bands on calibration for selected strategies; test failure on holdout ECDF
         failures = 0
-        for j in sel:
+        eps = eps_sqrt_calibrator(n=n_cal, K=K, S=S, delta=delta)
+
+        for rank_in_sel, j in enumerate(sel):
             samp_cal = cal_scores[:, j]
-            eps = eps_sqrt_calibrator(n=n_cal, K=K, S=S, delta=delta)
             x, L, U = cdf_band_from_samples(samp_cal, eps)
 
-            # Proxy “truth”: holdout ECDF evaluated at same x points
             F_hold = ecdf(hol_scores[:, j], x)
-
             ok = np.all((F_hold >= L) & (F_hold <= U))
-            failures += (0 if ok else 1)
+            if not ok:
+                failures += 1
 
-            if (not example_band_made) and cfg["plots"]["make_example_band_plot"]:
-                # plot one representative band (best selected)
-                if j == sel[int(cfg["plots"]["example_strategy_rank"]) - 1]:
-                    plt.figure()
-                    Fhat = np.arange(1, len(x)+1) / len(x)
-                    plt.step(x, Fhat, where="post")
-                    plt.step(x, L, where="post")
-                    plt.step(x, U, where="post")
-                    plt.step(x, F_hold, where="post")
-                    plt.xlabel("reward")
-                    plt.ylabel("CDF")
-                    plt.title(f"Post-selection CDF band (strategy={strat_names[j]})")
-                    plt.savefig(os.path.join(plot_dir, f"cdf_band_example_{strat_names[j]}.pdf"), bbox_inches="tight")
-                    plt.close()
-                    example_band_made = True
+            # Make one representative CDF-band plot once
+            if make_example and (not example_band_made) and rank_in_sel == example_rank:
+                Fhat = np.arange(1, len(x) + 1) / len(x)
 
-        fcp = failures / max(S, 1)
-        fcps.append(fcp)
+                plt.figure()
+                plt.step(x, Fhat, where="post", label="ECDF (cal)")
+                plt.step(x, L, where="post", label="Lower band")
+                plt.step(x, U, where="post", label="Upper band")
+                plt.step(x, F_hold, where="post", label="ECDF (holdout)")
+                plt.xlabel("reward")
+                plt.ylabel("CDF")
+                plt.title(f"Post-selection CDF band (strategy={strat_names[j]})")
+                plt.legend()
+                plt.savefig(
+                    os.path.join(plot_dir, f"cdf_band_example_{strat_names[j]}.pdf"),
+                    bbox_inches="tight",
+                )
+                plt.close()
+                example_band_made = True
 
-    fcps = np.array(fcps, dtype=float)
-    fcr = fcps.mean()
+        fcps.append(failures / max(S, 1))
 
-    # Plot FCP distribution
+    fcps_np = np.asarray(fcps, dtype=float)
+    fcr = float(fcps_np.mean())
+
+    # Plot FCP histogram
     plt.figure()
-    plt.hist(fcps, bins=30)
+    plt.hist(fcps_np, bins=30)
     plt.axvline(float(delta), linestyle="--")
     plt.xlabel("FCP")
     plt.ylabel("count")
@@ -130,10 +203,25 @@ def main() -> None:
     plt.close()
 
     # Save summary
-    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump({"FCR": float(fcr), "delta": delta, "R": R, "n_examples": n_ex, "n_cal": n_cal}, f, indent=2)
+    summary = {
+        "FCR": fcr,
+        "delta": delta,
+        "R": R,
+        "n_examples": int(n_ex),
+        "n_cal": int(n_cal),
+        "n_holdout": int(n_hol),
+        "run_dir": run_dir,
+        "K": K,
+        "M": M,
+        "selected_example_plot_rank": int(example_rank + 1),
+    }
+    with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
 
-    print(f"[ok] analyze done. FCR={fcr:.4f}, outputs in {out_dir}")
+    print(f"[ok] analyze done. FCR={fcr:.4f}")
+    print(f"[ok] outputs in: {run_dir}")
+    print(f"[ok] plots in:   {plot_dir}")
+
 
 if __name__ == "__main__":
     main()
