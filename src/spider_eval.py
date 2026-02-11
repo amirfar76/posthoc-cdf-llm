@@ -11,10 +11,12 @@ _CODE_FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.DOTALL | re.IGNORECASE
 def clean_sql(text: str) -> str:
     """
     Extract a single SQL statement from model output.
+
     Handles:
       - ```sql ... ```
       - leading 'SQL:' prefixes
       - extra commentary before/after
+      - multiple statements -> keep the first
     """
     if text is None:
         return ""
@@ -28,8 +30,7 @@ def clean_sql(text: str) -> str:
     # Remove leading "SQL:" or similar
     t = re.sub(r"^\s*(sql\s*:\s*)", "", t, flags=re.IGNORECASE).strip()
 
-    # If there are multiple statements, keep the first non-empty one.
-    # (Spider gold is typically a single statement.)
+    # Keep the first non-empty statement (Spider is typically single-statement)
     parts = [p.strip() for p in t.split(";") if p.strip()]
     if not parts:
         return t.strip()
@@ -56,9 +57,7 @@ def _fetch_all(db_path: str, sql: str) -> Tuple[bool, List[Tuple[Any, ...]]]:
 
 
 def _bag(rows: List[Tuple[Any, ...]]) -> dict:
-    """
-    Multiset / bag representation of result rows.
-    """
+    """Multiset / bag representation of result rows."""
     d: dict = {}
     for r in rows:
         d[r] = d.get(r, 0) + 1
@@ -66,6 +65,9 @@ def _bag(rows: List[Tuple[Any, ...]]) -> dict:
 
 
 def execution_accuracy(db_path: str, pred_sql: str, gold_sql: str) -> float:
+    """
+    Binary reward in {0,1} based on exact match of result sets (order-insensitive).
+    """
     pred_sql = clean_sql(pred_sql)
     gold_sql = clean_sql(gold_sql)
 
@@ -80,11 +82,13 @@ def execution_accuracy(db_path: str, pred_sql: str, gold_sql: str) -> float:
 
 def execution_f1(db_path: str, pred_sql: str, gold_sql: str) -> float:
     """
-    Continuous reward in [0,1] based on overlap between result multisets.
+    Continuous reward in [0,1] based on overlap between result *multisets*.
+
     - If pred query fails to execute -> 0
     - If gold fails (shouldn't) -> 0
-    - Otherwise: F1 = 2 * prec * rec / (prec + rec),
-      where precision/recall computed from multiset intersection sizes.
+    - Otherwise: F1 = 2 * prec * rec / (prec + rec)
+
+    Precision/recall computed from multiset intersection sizes.
     """
     pred_sql = clean_sql(pred_sql)
     gold_sql = clean_sql(gold_sql)
@@ -100,7 +104,6 @@ def execution_f1(db_path: str, pred_sql: str, gold_sql: str) -> float:
     bag_p = _bag(res_p)
     bag_g = _bag(res_g)
 
-    # Intersection size for multisets
     inter = 0
     for k, vp in bag_p.items():
         vg = bag_g.get(k, 0)
@@ -109,7 +112,7 @@ def execution_f1(db_path: str, pred_sql: str, gold_sql: str) -> float:
     total_p = len(res_p)
     total_g = len(res_g)
 
-    # Handle empty result edge-cases
+    # Empty result edge-cases
     if total_p == 0 and total_g == 0:
         return 1.0
     if total_p == 0 or total_g == 0:
