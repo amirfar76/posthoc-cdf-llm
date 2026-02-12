@@ -1,0 +1,60 @@
+run:
+  name: spider_decoding_more
+  seed: 0
+  out_dir: runs
+  cache_dir: runs_cache_v2
+
+data:
+  data_root: data/spider
+  dataset: spider
+  split: dev
+  max_examples: 30
+
+llm:
+  model_ids:
+    - Qwen/Qwen2.5-7B-Instruct
+    - Qwen/Qwen2.5-3B-Instruct
+    - mistralai/Mistral-7B-Instruct-v0.3
+    - meta-llama/Llama-3-8B-Instruct
+  max_new_tokens: 160
+  temperature: 0.7
+  top_p: 0.95
+  do_sample_single: false
+
+verifier:
+  w_exec: 0.7   # reward = 0.7*execution_F1 + 0.3*sql_token_F1
+
+strategies:
+  - name: single
+    type: single
+  - name: bon_2
+    type: bon
+    n: 2
+  - name: bon_4
+    type: bon
+    n: 4
+  - name: bon_8
+    type: bon
+    n: 8
+  - name: bon_16
+    type: bon
+    n: 16
+  - name: iad_2
+    type: iad
+    t: 2
+  - name: iad_4
+    type: iad
+    t: 4
+  - name: iad_8
+    type: iad
+    t: 8
+
+selection:
+  M: 2
+  delta: 0.1
+  replications: 200
+  cal_frac: 0.5
+
+plots:
+  make_example_band_plot: true
+  example_strategy_rank: 1
