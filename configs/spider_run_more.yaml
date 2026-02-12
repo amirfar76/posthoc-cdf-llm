@@ -11,7 +11,7 @@ data:
   max_examples: 200
 
 llm:
-  model_ids: Qwen/Qwen2.5-7B-Instruct
+  model_id: Qwen/Qwen2.5-7B-Instruct
   max_new_tokens: 160
   temperature: 0.7
   top_p: 0.95
