@@ -1,5 +1,5 @@
 run:
-  name: spider_decoding_more
+  name: spider_decoding_temps_iad_bon_smallT
   seed: 0
   out_dir: runs
   cache_dir: runs_cache_v2
@@ -8,55 +8,76 @@ data:
   data_root: data/spider
   dataset: spider
   split: dev
-  max_examples: 200
+  max_examples: 20
 
 llm:
   model_id: Qwen/Qwen2.5-7B-Instruct
   max_new_tokens: 160
+  # default decoding params (can be overridden per-strategy below)
   temperature: 0.7
   top_p: 0.95
   do_sample_single: false
 
 verifier:
-  w_exec: 0.7   # reward = 0.7*execution_F1 + 0.3*sql_token_F1
+  # Use Spider official component-level F1 as reward in [0,1]
+  reward_type: spider_component_f1
 
 strategies:
-  - name: single
+  # --- Greedy single decode (1) ---
+  - name: single_greedy
     type: single
 
-  # BoN family (15)
-  - {name: bon_2,  type: bon, n: 2}
-  - {name: bon_3,  type: bon, n: 3}
-  - {name: bon_4,  type: bon, n: 4}
-  - {name: bon_5,  type: bon, n: 5}
-  - {name: bon_6,  type: bon, n: 6}
-  - {name: bon_8,  type: bon, n: 8}
-  - {name: bon_10, type: bon, n: 10}
-  - {name: bon_12, type: bon, n: 12}
-  - {name: bon_16, type: bon, n: 16}
-  - {name: bon_20, type: bon, n: 20}
-  - {name: bon_24, type: bon, n: 24}
-  - {name: bon_32, type: bon, n: 32}
-  - {name: bon_40, type: bon, n: 40}
-  - {name: bon_48, type: bon, n: 48}
-  - {name: bon_64, type: bon, n: 64}
+  # --- Optional: sampled single-turn baselines (keep if you want) ---
+  - {name: single_t0p3_p0p90, type: single, do_sample: true, temperature: 0.3, top_p: 0.90}
+  - {name: single_t0p3_p0p95, type: single, do_sample: true, temperature: 0.3, top_p: 0.95}
+  - {name: single_t0p7_p0p90, type: single, do_sample: true, temperature: 0.7, top_p: 0.90}
+  - {name: single_t0p7_p0p95, type: single, do_sample: true, temperature: 0.7, top_p: 0.95}
+  - {name: single_t1p0_p0p90, type: single, do_sample: true, temperature: 1.0, top_p: 0.90}
+  - {name: single_t1p0_p0p95, type: single, do_sample: true, temperature: 1.0, top_p: 0.95}
 
-  # IAD family (15)
-  - {name: iad_2,  type: iad, t: 2}
-  - {name: iad_3,  type: iad, t: 3}
-  - {name: iad_4,  type: iad, t: 4}
-  - {name: iad_5,  type: iad, t: 5}
-  - {name: iad_6,  type: iad, t: 6}
-  - {name: iad_8,  type: iad, t: 8}
-  - {name: iad_10, type: iad, t: 10}
-  - {name: iad_12, type: iad, t: 12}
-  - {name: iad_14, type: iad, t: 14}
-  - {name: iad_16, type: iad, t: 16}
-  - {name: iad_20, type: iad, t: 20}
-  - {name: iad_24, type: iad, t: 24}
-  - {name: iad_28, type: iad, t: 28}
-  - {name: iad_32, type: iad, t: 32}
-  - {name: iad_40, type: iad, t: 40}
+  # --- BoN family: n in {2,4,6} × (temperature, top_p) ---
+  - {name: bon2_t0p3_p0p90, type: bon, n: 2, temperature: 0.3, top_p: 0.90}
+  - {name: bon2_t0p3_p0p95, type: bon, n: 2, temperature: 0.3, top_p: 0.95}
+  - {name: bon2_t0p7_p0p90, type: bon, n: 2, temperature: 0.7, top_p: 0.90}
+  - {name: bon2_t0p7_p0p95, type: bon, n: 2, temperature: 0.7, top_p: 0.95}
+  - {name: bon2_t1p0_p0p90, type: bon, n: 2, temperature: 1.0, top_p: 0.90}
+  - {name: bon2_t1p0_p0p95, type: bon, n: 2, temperature: 1.0, top_p: 0.95}
+
+  - {name: bon4_t0p3_p0p90, type: bon, n: 4, temperature: 0.3, top_p: 0.90}
+  - {name: bon4_t0p3_p0p95, type: bon, n: 4, temperature: 0.3, top_p: 0.95}
+  - {name: bon4_t0p7_p0p90, type: bon, n: 4, temperature: 0.7, top_p: 0.90}
+  - {name: bon4_t0p7_p0p95, type: bon, n: 4, temperature: 0.7, top_p: 0.95}
+  - {name: bon4_t1p0_p0p90, type: bon, n: 4, temperature: 1.0, top_p: 0.90}
+  - {name: bon4_t1p0_p0p95, type: bon, n: 4, temperature: 1.0, top_p: 0.95}
+
+  - {name: bon6_t0p3_p0p90, type: bon, n: 6, temperature: 0.3, top_p: 0.90}
+  - {name: bon6_t0p3_p0p95, type: bon, n: 6, temperature: 0.3, top_p: 0.95}
+  - {name: bon6_t0p7_p0p90, type: bon, n: 6, temperature: 0.7, top_p: 0.90}
+  - {name: bon6_t0p7_p0p95, type: bon, n: 6, temperature: 0.7, top_p: 0.95}
+  - {name: bon6_t1p0_p0p90, type: bon, n: 6, temperature: 1.0, top_p: 0.90}
+  - {name: bon6_t1p0_p0p95, type: bon, n: 6, temperature: 1.0, top_p: 0.95}
+
+  # --- IAD family: t in {2,4,6} × (temperature, top_p) ---
+  - {name: iad2_t0p3_p0p90, type: iad, t: 2, temperature: 0.3, top_p: 0.90}
+  - {name: iad2_t0p3_p0p95, type: iad, t: 2, temperature: 0.3, top_p: 0.95}
+  - {name: iad2_t0p7_p0p90, type: iad, t: 2, temperature: 0.7, top_p: 0.90}
+  - {name: iad2_t0p7_p0p95, type: iad, t: 2, temperature: 0.7, top_p: 0.95}
+  - {name: iad2_t1p0_p0p90, type: iad, t: 2, temperature: 1.0, top_p: 0.90}
+  - {name: iad2_t1p0_p0p95, type: iad, t: 2, temperature: 1.0, top_p: 0.95}
+
+  - {name: iad4_t0p3_p0p90, type: iad, t: 4, temperature: 0.3, top_p: 0.90}
+  - {name: iad4_t0p3_p0p95, type: iad, t: 4, temperature: 0.3, top_p: 0.95}
+  - {name: iad4_t0p7_p0p90, type: iad, t: 4, temperature: 0.7, top_p: 0.90}
+  - {name: iad4_t0p7_p0p95, type: iad, t: 4, temperature: 0.7, top_p: 0.95}
+  - {name: iad4_t1p0_p0p90, type: iad, t: 4, temperature: 1.0, top_p: 0.90}
+  - {name: iad4_t1p0_p0p95, type: iad, t: 4, temperature: 1.0, top_p: 0.95}
+
+  - {name: iad6_t0p3_p0p90, type: iad, t: 6, temperature: 0.3, top_p: 0.90}
+  - {name: iad6_t0p3_p0p95, type: iad, t: 6, temperature: 0.3, top_p: 0.95}
+  - {name: iad6_t0p7_p0p90, type: iad, t: 6, temperature: 0.7, top_p: 0.90}
+  - {name: iad6_t0p7_p0p95, type: iad, t: 6, temperature: 0.7, top_p: 0.95}
+  - {name: iad6_t1p0_p0p90, type: iad, t: 6, temperature: 1.0, top_p: 0.90}
+  - {name: iad6_t1p0_p0p95, type: iad, t: 6, temperature: 1.0, top_p: 0.95}
 
 selection:
   M: 2
