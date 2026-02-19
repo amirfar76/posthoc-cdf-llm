@@ -16,6 +16,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.cache import DiskCache
 from src.spider_eval import clean_sql, combined_reward
 
+# Optional: new reward (Spider official component-level F1 in [0,1])
+try:
+    from src.spider_eval import spider_component_f1 as _spider_component_f1
+except Exception:
+    _spider_component_f1 = None
+
 
 def load_jsonl(path: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -151,6 +157,55 @@ class LocalLLM:
         return self.tok.decode(out[0], skip_special_tokens=True)
 
 
+def effective_decoding_params(cfg: Dict[str, Any], strat: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strategy-level overrides take precedence over llm defaults.
+    Returns: do_sample, temperature, top_p.
+    """
+    llm_cfg = cfg.get("llm", {})
+
+    # defaults
+    temperature = float(llm_cfg.get("temperature", 0.7))
+    top_p = float(llm_cfg.get("top_p", 0.95))
+
+    # overrides (per-strategy)
+    if "temperature" in strat:
+        temperature = float(strat["temperature"])
+    if "top_p" in strat:
+        top_p = float(strat["top_p"])
+
+    # do_sample logic:
+    # - single uses llm.do_sample_single unless overridden in strategy
+    # - bon/iad are sampled by design unless overridden explicitly
+    if "do_sample" in strat:
+        do_sample = bool(strat["do_sample"])
+    else:
+        if strat.get("type") == "single":
+            do_sample = bool(llm_cfg.get("do_sample_single", False))
+        else:
+            do_sample = True
+
+    return {"do_sample": do_sample, "temperature": temperature, "top_p": top_p}
+
+
+def compute_reward(cfg: Dict[str, Any], db: str, pred_sql: str, gold_sql_str: str) -> float:
+    ver = cfg.get("verifier", {})
+    reward_type = ver.get("reward_type", "combined")  # default keeps old behavior
+
+    if reward_type == "spider_component_f1":
+        if _spider_component_f1 is None:
+            raise KeyError(
+                "Config requests verifier.reward_type=spider_component_f1, but src.spider_eval "
+                "does not export spider_component_f1. Either (i) add spider_component_f1 to "
+                "src/spider_eval.py or (ii) remove reward_type and use verifier.w_exec."
+            )
+        return float(_spider_component_f1(db, pred_sql, gold_sql_str))
+
+    # legacy combined reward
+    w_exec = float(ver.get("w_exec", 0.7))
+    return float(combined_reward(db, pred_sql, gold_sql_str, w_exec=w_exec))
+
+
 def run_one(
     llm: LocalLLM,
     cache: DiskCache,
@@ -169,13 +224,24 @@ def run_one(
     schema = schema_map.get(db_id, "")
     schema_h = stable_hash_str(schema) if schema else "no_schema"
 
-    reward_version = "v2_execf1_plus_tokf1"
+    # decoding params (strategy overrides supported)
+    dec = effective_decoding_params(cfg, strat)
+    do_sample = bool(dec["do_sample"])
+    temperature = float(dec["temperature"])
+    top_p = float(dec["top_p"])
+
+    # reward version for caching / provenance
+    ver = cfg.get("verifier", {})
+    reward_type = ver.get("reward_type", "combined")
+    reward_version = "spider_component_f1" if reward_type == "spider_component_f1" else "v2_execf1_plus_tokf1"
+
     key = {
         "run_name": cfg["run"]["name"],
         "model_id": cfg["llm"]["model_id"],
         "max_new_tokens": int(cfg["llm"]["max_new_tokens"]),
-        "temperature": float(cfg["llm"]["temperature"]),
-        "top_p": float(cfg["llm"]["top_p"]),
+        "do_sample": bool(do_sample),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
         "strategy": strat,
         "db_id": db_id,
         "schema_hash": schema_h,
@@ -196,22 +262,17 @@ def run_one(
 
     typ = strat["type"]
 
-    # strategy: make BON/IAD sampled to get diversity; single can be greedy
-    base_do_sample = bool(cfg["llm"].get("do_sample_single", False))
-    temperature = float(cfg["llm"]["temperature"])
-    top_p = float(cfg["llm"]["top_p"])
-
     candidates: List[Dict[str, Any]] = []
 
     if typ == "single":
         raw = llm.chat(
             do_messages(build_prompt(q, schema)),
-            do_sample=base_do_sample,
+            do_sample=do_sample,
             temperature=temperature,
             top_p=top_p,
         )
         pred = clean_sql(raw)
-        score = combined_reward(db, pred, gold, w_exec=float(cfg["verifier"]["w_exec"]))
+        score = compute_reward(cfg, db, pred, gold)
         candidates.append({"raw": raw, "pred": pred, "score": score})
         best = max(candidates, key=lambda c: c["score"])
 
@@ -220,12 +281,12 @@ def run_one(
         for _ in range(n):
             raw = llm.chat(
                 do_messages(build_prompt(q, schema)),
-                do_sample=True,
+                do_sample=do_sample,
                 temperature=temperature,
                 top_p=top_p,
             )
             pred = clean_sql(raw)
-            score = combined_reward(db, pred, gold, w_exec=float(cfg["verifier"]["w_exec"]))
+            score = compute_reward(cfg, db, pred, gold)
             candidates.append({"raw": raw, "pred": pred, "score": score})
         best = max(candidates, key=lambda c: c["score"])
 
@@ -234,12 +295,12 @@ def run_one(
         # initial sample
         raw0 = llm.chat(
             do_messages(build_prompt(q, schema)),
-            do_sample=True,
+            do_sample=do_sample,
             temperature=temperature,
             top_p=top_p,
         )
         pred0 = clean_sql(raw0)
-        s0 = combined_reward(db, pred0, gold, w_exec=float(cfg["verifier"]["w_exec"]))
+        s0 = compute_reward(cfg, db, pred0, gold)
         candidates.append({"raw": raw0, "pred": pred0, "score": s0})
 
         best = max(candidates, key=lambda c: c["score"])
@@ -254,12 +315,12 @@ def run_one(
             )
             raw = llm.chat(
                 do_messages(refine_user),
-                do_sample=True,
+                do_sample=do_sample,
                 temperature=temperature,
                 top_p=top_p,
             )
             pred = clean_sql(raw)
-            score = combined_reward(db, pred, gold, w_exec=float(cfg["verifier"]["w_exec"]))
+            score = compute_reward(cfg, db, pred, gold)
             candidates.append({"raw": raw, "pred": pred, "score": score})
             best = max(candidates, key=lambda c: c["score"])
             worst = min(candidates, key=lambda c: c["score"])
