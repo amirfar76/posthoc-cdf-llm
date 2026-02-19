@@ -159,3 +159,15 @@ def combined_reward(db_path: str, pred_sql: str, gold_sql: str, w_exec: float = 
     w_exec = float(w_exec)
     w_exec = min(max(w_exec, 0.0), 1.0)
     return float(w_exec * exec_f + (1.0 - w_exec) * tok_f)
+
+def spider_component_f1(db_path: str, pred_sql: str, gold_sql: str) -> float:
+    """
+    Spider-style execution-based score in [0,1].
+
+    In this codebase, the most standard, defensible scalar reward aligned with
+    Spider evaluation is the execution-based overlap score `execution_f1`.
+    We expose it under a stable name so experiments can switch reward functions
+    via config (reward_type: spider_component_f1).
+    """
+    return float(execution_f1(db_path, pred_sql, gold_sql))
+
